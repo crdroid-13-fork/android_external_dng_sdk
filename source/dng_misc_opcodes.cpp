@@ -254,6 +254,7 @@ dng_rect dng_area_spec::Overlap (const dng_rect &tile) const
 
 /*****************************************************************************/
 
+DNG_ATTRIB_NO_SANITIZE("unsigned-integer-overflow")
 dng_rect dng_area_spec::ScaledOverlap (const dng_rect &tile) const
 	{
 	
@@ -440,7 +441,7 @@ void dng_opcode_MapTable::ReplicateLastEntry ()
 	
 	uint16 *table = fTable->Buffer_uint16 ();
 		
-	uint16 lastEntry = table [fCount];
+	uint16 lastEntry = table [fCount - 1];
 	
 	for (uint32 index = fCount; index < 0x10000; index++)
 		{
@@ -511,7 +512,7 @@ void dng_opcode_MapTable::Prepare (dng_negative &negative,
 		
 		uint16 *dstTable = fBlackAdjustedTable->Buffer_uint16 ();
 		
-		real64 srcScale = 65535.0 / (65535.0 - blackLevel);
+		real64 srcScale = (blackLevel < 65535) ? 65535.0 / (65535.0 - blackLevel) : 0.0;
 		
 		real64 dstScale = (65535.0 - blackLevel) / 65535.0;
 		
@@ -560,12 +561,17 @@ void dng_opcode_MapTable::ProcessArea (dng_negative & /* negative */,
   
 		const uint16 *table = fBlackAdjustedTable.Get () ? fBlackAdjustedTable->Buffer_uint16 ()
 														 : fTable			  ->Buffer_uint16 ();
-		
-		for (uint32 plane = fAreaSpec.Plane ();
-			 plane < fAreaSpec.Plane () + fAreaSpec.Planes () &&
-			 plane < buffer.Planes ();
-			 plane++)
+// BEGIN GOOGLE MODIFICATION
+		const uint32 planeStart = fAreaSpec.Plane ();
+		const uint32 planeCount = fAreaSpec.Planes ();
+		const uint32 bufferPlanes = buffer.Planes ();
+
+		for (uint32 plane = planeStart;
+			 plane < bufferPlanes &&
+			 plane - planeStart < planeCount;
+			 ++plane)
 			{
+// END GOOGLE MODIFICATION
 			
 			DoMapArea16 (buffer.DirtyPixel_uint16 (overlap.t, overlap.l, plane),
 						 1,
@@ -994,15 +1000,17 @@ void dng_opcode_DeltaPerRow::ProcessArea (dng_negative &negative,
 										  const dng_rect & /* imageBounds */)
 	{
 	
-	dng_rect overlap = fAreaSpec.Overlap (dstArea);
+	const dng_rect overlap = fAreaSpec.Overlap (dstArea);
 	
 	if (overlap.NotEmpty ())
 		{
 		
-		uint32 cols = overlap.W ();
-		
-		uint32 colPitch = fAreaSpec.ColPitch ();
+		const uint32 rowPitch = fAreaSpec.RowPitch ();
+		const uint32 colPitch = fAreaSpec.ColPitch ();
   
+		const uint32 rows = (overlap.H () + rowPitch - 1) / rowPitch;
+		const uint32 cols = (overlap.W () + colPitch - 1) / colPitch;
+
 		real32 scale = fScale;
 		
 		if (Stage () >= 2 && negative.Stage3BlackLevel () != 0)
@@ -1018,16 +1026,20 @@ void dng_opcode_DeltaPerRow::ProcessArea (dng_negative &negative,
 			
 			const real32 *table = fTable->Buffer_real32 () +
 								  ((overlap.t - fAreaSpec.Area ().t) /
-								   fAreaSpec.RowPitch ());
+								   rowPitch);
+
+			int32 row = overlap.t;
 			
-			for (int32 row = overlap.t; row < overlap.b; row += fAreaSpec.RowPitch ())
+			for (uint32 rowIdx = 0; rowIdx < rows; rowIdx++)
 				{
 				
 				real32 rowDelta = *(table++) * scale;
 				
 				real32 *dPtr = buffer.DirtyPixel_real32 (row, overlap.l, plane);
 				
-				for (uint32 col = 0; col < cols; col += colPitch)
+				uint32 col = 0;
+				
+				for (uint32 colIdx = 0; colIdx < cols; colIdx++)
 					{
 					
 					real32 x = dPtr [col];
@@ -1035,14 +1047,18 @@ void dng_opcode_DeltaPerRow::ProcessArea (dng_negative &negative,
 					real32 y = x + rowDelta;
 							   
 					dPtr [col] = Pin_real32 (-1.0f, y, 1.0f);
+
+					col += colPitch;
 					
-					}
+					} // cols
+
+				row += rowPitch;
 				
-				}
+				} // rows
 			
-			}
+			} // planes
 		
-		}
+		} // overlap not empty
 	
 	}
 
@@ -1208,15 +1224,18 @@ void dng_opcode_DeltaPerColumn::ProcessArea (dng_negative &negative,
 											 const dng_rect & /* imageBounds */)
 	{
 	
-	dng_rect overlap = fAreaSpec.Overlap (dstArea);
+	const dng_rect overlap = fAreaSpec.Overlap (dstArea);
 	
 	if (overlap.NotEmpty ())
 		{
 		
-		uint32 rows = (overlap.H () + fAreaSpec.RowPitch () - 1) /
-					  fAreaSpec.RowPitch ();
-		
-		int32 rowStep = buffer.RowStep () * fAreaSpec.RowPitch ();
+		const uint32 rowPitch = fAreaSpec.RowPitch ();
+		const uint32 colPitch = fAreaSpec.ColPitch ();
+  
+		const uint32 rows = (overlap.H () + rowPitch - 1) / rowPitch;
+		const uint32 cols = (overlap.W () + colPitch - 1) / colPitch;
+
+		const int32 rowStep = buffer.RowStep () * rowPitch;
 		
 		real32 scale = fScale;
 		
@@ -1233,16 +1252,18 @@ void dng_opcode_DeltaPerColumn::ProcessArea (dng_negative &negative,
 			
 			const real32 *table = fTable->Buffer_real32 () +
 								  ((overlap.l - fAreaSpec.Area ().l) /
-								   fAreaSpec.ColPitch ());
+								   colPitch);
 			
-			for (int32 col = overlap.l; col < overlap.r; col += fAreaSpec.ColPitch ())
+			int32 col = overlap.l;
+				
+			for (uint32 colIdx = 0; colIdx < cols; colIdx++)
 				{
 				
 				real32 colDelta = *(table++) * scale;
 				
 				real32 *dPtr = buffer.DirtyPixel_real32 (overlap.t, col, plane);
 				
-				for (uint32 row = 0; row < rows; row++)
+				for (uint32 rowIdx = 0; rowIdx < rows; rowIdx++)
 					{
 					
 					real32 x = dPtr [0];
@@ -1253,13 +1274,15 @@ void dng_opcode_DeltaPerColumn::ProcessArea (dng_negative &negative,
 					
 					dPtr += rowStep;
 					
-					}
+					} // rows
+
+				col += colPitch;
 				
-				}
+				} // columns
 			
-			}
+			} // planes
 		
-		}
+		} // overlap not empty
 	
 	}
 
@@ -1396,15 +1419,17 @@ void dng_opcode_ScalePerRow::ProcessArea (dng_negative &negative,
 										  const dng_rect & /* imageBounds */)
 	{
 	
-	dng_rect overlap = fAreaSpec.Overlap (dstArea);
+	const dng_rect overlap = fAreaSpec.Overlap (dstArea);
 	
 	if (overlap.NotEmpty ())
 		{
 		
-		uint32 cols = overlap.W ();
-		
-		uint32 colPitch = fAreaSpec.ColPitch ();
+		const uint32 rowPitch = fAreaSpec.RowPitch ();
+		const uint32 colPitch = fAreaSpec.ColPitch ();
   
+		const uint32 rows = (overlap.H () + rowPitch - 1) / rowPitch;
+		const uint32 cols = (overlap.W () + colPitch - 1) / colPitch;
+
 		real32 blackOffset = 0.0f;
 		
 		if (Stage () >= 2 && negative.Stage3BlackLevel () != 0)
@@ -1420,16 +1445,20 @@ void dng_opcode_ScalePerRow::ProcessArea (dng_negative &negative,
 			
 			const real32 *table = fTable->Buffer_real32 () +
 								  ((overlap.t - fAreaSpec.Area ().t) /
-								   fAreaSpec.RowPitch ());
+								   rowPitch);
+
+			int32 row = overlap.t;
 			
-			for (int32 row = overlap.t; row < overlap.b; row += fAreaSpec.RowPitch ())
+			for (uint32 rowIdx = 0; rowIdx < rows; rowIdx++)
 				{
 				
 				real32 rowScale = *(table++);
 				
 				real32 *dPtr = buffer.DirtyPixel_real32 (row, overlap.l, plane);
-	
-				for (uint32 col = 0; col < cols; col += colPitch)
+
+				int32 col = 0;
+				
+				for (uint32 colIdx = 0; colIdx < cols; colIdx++)
 					{
 					
 					real32 x = dPtr [col];
@@ -1437,14 +1466,18 @@ void dng_opcode_ScalePerRow::ProcessArea (dng_negative &negative,
 					real32 y = (x - blackOffset) * rowScale + blackOffset;
 						
 					dPtr [col] = Pin_real32 (-1.0f, y, 1.0f);
-					
-					}
 
-				}
+					col += colPitch;
+					
+					} // cols
+
+				row += rowPitch;
+
+				} // rows
 			
-			}
+			} // planes
 		
-		}
+		} // overlap not empty
 	
 	}
 
@@ -1581,15 +1614,18 @@ void dng_opcode_ScalePerColumn::ProcessArea (dng_negative &negative,
 											 const dng_rect & /* imageBounds */)
 	{
 	
-	dng_rect overlap = fAreaSpec.Overlap (dstArea);
+	const dng_rect overlap = fAreaSpec.Overlap (dstArea);
 	
 	if (overlap.NotEmpty ())
 		{
 		
-		uint32 rows = (overlap.H () + fAreaSpec.RowPitch () - 1) /
-					  fAreaSpec.RowPitch ();
-		
-		int32 rowStep = buffer.RowStep () * fAreaSpec.RowPitch ();
+		const uint32 rowPitch = fAreaSpec.RowPitch ();
+		const uint32 colPitch = fAreaSpec.ColPitch ();
+  
+		const uint32 rows = (overlap.H () + rowPitch - 1) / rowPitch;
+		const uint32 cols = (overlap.W () + colPitch - 1) / colPitch;
+
+		const int32 rowStep = buffer.RowStep () * rowPitch;
 		
 		real32 blackOffset = 0.0f;
 		
@@ -1606,16 +1642,18 @@ void dng_opcode_ScalePerColumn::ProcessArea (dng_negative &negative,
 			
 			const real32 *table = fTable->Buffer_real32 () +
 								  ((overlap.l - fAreaSpec.Area ().l) /
-								   fAreaSpec.ColPitch ());
+								   colPitch);
 			
-			for (int32 col = overlap.l; col < overlap.r; col += fAreaSpec.ColPitch ())
+			int32 col = overlap.l;
+			
+			for (uint32 colIdx = 0; colIdx < cols; colIdx++)
 				{
 				
 				real32 colScale = *(table++);
 				
 				real32 *dPtr = buffer.DirtyPixel_real32 (overlap.t, col, plane);
 				
-				for (uint32 row = 0; row < rows; row++)
+				for (uint32 rowIdx = 0; rowIdx < rows; rowIdx++)
 					{
 					
 					real32 x = dPtr [0];
@@ -1626,13 +1664,15 @@ void dng_opcode_ScalePerColumn::ProcessArea (dng_negative &negative,
 					
 					dPtr += rowStep;
 					
-					}
+					} // rows
 				
-				}
+				col += colPitch;
+				
+				} // cols
 			
-			}
+			} // planes
 		
-		}
+		} // overlap not empty
 	
 	}
 
